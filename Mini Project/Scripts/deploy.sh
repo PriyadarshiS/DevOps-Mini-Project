@@ -1,0 +1,44 @@
+# monitoring/docker-compose.yml
+version: '3.8'
+
+services:
+  nagios:
+    image: jasonrivers/nagios:latest
+    container_name: nagios
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nagios/nagios.cfg:/opt/nagios/etc/nagios.cfg
+      - ./nagios/commands.cfg:/opt/nagios/etc/objects/commands.cfg
+      - ./nagios/services.cfg:/opt/nagios/etc/objects/services.cfg
+      - nagios_var:/opt/nagios/var
+      - nagios_etc:/opt/nagios/etc
+    environment:
+      - NAGIOSADMIN_USER=admin
+      - NAGIOSADMIN_PASS=nagios123
+      - NAGIOS_FQDN=nagios.local
+      - NAGIOS_TIMEZONE=America/New_York
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+  nagios-graph:
+    image: tiagosiebler/nagiosgraph:latest
+    container_name: nagios-graph
+    ports:
+      - "8081:80"
+    volumes:
+      - nagios_var:/opt/nagios/var
+    depends_on:
+      - nagios
+    restart: unless-stopped
+    networks:
+      - monitoring
+
+volumes:
+  nagios_var:
+  nagios_etc:
+
+networks:
+  monitoring:
+    driver: bridge

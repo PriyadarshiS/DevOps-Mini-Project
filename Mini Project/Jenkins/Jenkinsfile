@@ -1,0 +1,177 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_DEFAULT_REGION = 'us-west-2'
+        ECR_REPOSITORY = 'flask-ecs-app-app'
+        ECS_CLUSTER = 'flask-ecs-app-cluster'
+        ECS_SERVICE = 'flask-ecs-app-service'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def app = docker.build("${ECR_REPOSITORY}:${IMAGE_TAG}")
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                script {
+                    // Run basic tests
+                    sh '''
+                        docker run --rm ${ECR_REPOSITORY}:${IMAGE_TAG} python -c "
+import app
+import requests
+import threading
+import time
+
+# Start the app in a thread
+def run_app():
+    app.app.run(host='0.0.0.0', port=5000, debug=False)
+
+thread = threading.Thread(target=run_app)
+thread.daemon = True
+thread.start()
+time.sleep(2)
+
+# Test health endpoint
+try:
+    response = requests.get('http://localhost:5000/health')
+    assert response.status_code == 200
+    print('Health check passed')
+except Exception as e:
+    print(f'Health check failed: {e}')
+    exit(1)
+"
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    // Basic security scan with Trivy
+                    sh '''
+                        # Install trivy if not present
+                        which trivy || {
+                            wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                        }
+                        
+                        # Scan the image
+                        trivy image --exit-code 0 --severity HIGH,CRITICAL ${ECR_REPOSITORY}:${IMAGE_TAG}
+                    '''
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                script {
+                    withAWS(region: "${AWS_DEFAULT_REGION}", credentials: 'aws-credentials') {
+                        // Get ECR login token
+                        def loginCmd = sh(
+                            script: "aws ecr get-login-password --region ${AWS_DEFAULT_REGION}",
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Get account ID
+                        def accountId = sh(
+                            script: "aws sts get-caller-identity --query Account --output text",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def ecrUrl = "${accountId}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+                        
+                        // Login to ECR
+                        sh "echo ${loginCmd} | docker login --username AWS --password-stdin ${ecrUrl}"
+                        
+                        // Tag and push image
+                        sh "docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ecrUrl}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                        sh "docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${ecrUrl}/${ECR_REPOSITORY}:latest"
+                        sh "docker push ${ecrUrl}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                        sh "docker push ${ecrUrl}/${ECR_REPOSITORY}:latest"
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to ECS') {
+            steps {
+                script {
+                    withAWS(region: "${AWS_DEFAULT_REGION}", credentials: 'aws-credentials') {
+                        // Update ECS service to trigger new deployment
+                        sh """
+                            aws ecs update-service \
+                                --cluster ${ECS_CLUSTER} \
+                                --service ${ECS_SERVICE} \
+                                --force-new-deployment
+                        """
+                        
+                        // Wait for deployment to complete
+                        sh """
+                            aws ecs wait services-stable \
+                                --cluster ${ECS_CLUSTER} \
+                                --services ${ECS_SERVICE}
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                script {
+                    // Get ALB DNS name and perform health check
+                    withAWS(region: "${AWS_DEFAULT_REGION}", credentials: 'aws-credentials') {
+                        sleep(30) // Wait for ALB to update
+                        
+                        def albDns = sh(
+                            script: """
+                                aws elbv2 describe-load-balancers \
+                                    --query 'LoadBalancers[?contains(LoadBalancerName, `flask-ecs-app`)].DNSName' \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Health check
+                        retry(3) {
+                            sh "curl -f http://${albDns}/health"
+                        }
+                        
+                        echo "Deployment successful! Application is accessible at: http://${albDns}"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up local images
+            sh "docker rmi ${ECR_REPOSITORY}:${IMAGE_TAG} || true"
+            sh "docker system prune -f"
+        }
+        
+        success {
+            echo 'Pipeline succeeded!'
+            // Send notification to Slack/email
+        }
+        
+        failure {
+            echo 'Pipeline failed!'
+            // Send notification to team
+        }
+    }
+}
